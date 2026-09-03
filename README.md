@@ -148,7 +148,7 @@ Test policies with `make opa-test` — runs the full Rego test suite using `opa 
 
 ### Prerequisites
 
-- Go 1.25+
+- Go 1.25.14+
 - Python 3.10+
 - [OPA](https://www.openpolicyagent.org/docs/latest/#running-opa) (for policy tests, Phase 3+)
 
