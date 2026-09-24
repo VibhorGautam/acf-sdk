@@ -314,6 +314,14 @@ class Firewall:
         if decision == Decision.SANITISE:
             raw  = resp["sanitised_payload"]
             text = raw.decode("utf-8", errors="replace") if raw else None
+            if raw:
+                try:
+                    decoded = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+                else:
+                    if isinstance(decoded, str):
+                        text = decoded
             return SanitiseResult(
                 decision=decision,
                 sanitised_payload=raw,

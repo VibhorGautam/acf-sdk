@@ -11,8 +11,9 @@ defense is:
     pipeline = AgentPipeline([system_message_component, init_query_component,
                               llm, tools_loop])
 
-That is the on_context / on_tool_call enforcement point: it sees tool
-results before they go back to the LLM. An on_prompt element belongs earlier
+That is the on_context enforcement point: it sees tool results before they
+go back to the LLM. on_tool_call runs inside the guarded executor, before
+the tool executes. An on_prompt element belongs earlier
 in the outer list, between init_query_component and llm:
 
     AgentPipeline([system_message_component, init_query_component,
@@ -21,16 +22,10 @@ in the outer list, between init_query_component and llm:
 `PipelineConfig.defense` only accepts a name from agentdojo's own fixed
 DEFENSES list (raises ValueError otherwise), so a custom defense can't go
 through from_config's `defense=` field -- the pipeline has to be assembled
-by hand as above. build_pipeline() below does that assembly; it works today
-for C0 (no ACF element at all) and raises NotImplementedError for the other
-conditions until their ACF wiring lands.
+by hand as above. build_pipeline() below does that assembly.
 
-Division of labor: this file defines the shape of the integration --
-ACFPipelineElement's interface and where it splices in. Which ACF hook
-fires on which AgentDojo pipeline event, and how a BLOCK/SANITISE decision
-translates into the tuple query() must return, is deliberately left open --
-see conditions.py's per-condition acf_hooks and the NotImplementedError
-messages raised from there.
+An on_tool_call SANITISE response stops the batch because AgentDojo tool
+arguments cannot safely be reconstructed from arbitrary sanitised text.
 """
 from __future__ import annotations
 
@@ -45,11 +40,13 @@ if str(_THIS_DIR) not in sys.path:
 from agentdojo.agent_pipeline.agent_pipeline import AgentPipeline
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.agent_pipeline.basic_elements import InitQuery, SystemMessage
+from agentdojo.agent_pipeline.errors import AbortAgentError
 from agentdojo.agent_pipeline.tool_execution import ToolsExecutionLoop, ToolsExecutor
 from agentdojo.functions_runtime import Env, EmptyEnv, FunctionsRuntime
-from agentdojo.types import ChatMessage
+from agentdojo.types import ChatMessage, text_content_block_from_string
 
 from acf import Firewall
+from acf.models import Decision, SanitiseResult
 
 from conditions import CONDITIONS, Condition  # noqa: E402
 
@@ -79,21 +76,85 @@ class ACFPipelineElement(BasePipelineElement):
         messages: Sequence[ChatMessage] = (),
         extra_args: dict[str, Any] | None = None,
     ) -> tuple[str, FunctionsRuntime, Env, Sequence[ChatMessage], dict[str, Any]]:
-        raise NotImplementedError(
-            f"ACFPipelineElement(hook={self._hook!r}).query is a scaffold "
-            "stub. Call self._firewall.<hook>(...) with the right piece of "
-            "`query`/`messages`/`extra_args`, translate a BLOCK/SANITISE "
-            "Decision into this method's return tuple (e.g. raise to abort "
-            "the agent turn on BLOCK, or rewrite the outgoing text on "
-            "SANITISE), and return ALLOW cases unchanged. "
-            "See benchmarks/agentdojo/README.md."
-        )
+        args = extra_args if extra_args is not None else {}
+        if self._hook == "on_prompt":
+            if not messages or messages[-1]["role"] != "user":
+                return query, runtime, env, messages, args
+            result = self._firewall.on_prompt(query)
+            if result == Decision.BLOCK:
+                raise AbortAgentError("ACF blocked the prompt", list(messages), env)
+            if isinstance(result, SanitiseResult):
+                if result.sanitised_text is None:
+                    raise AbortAgentError("ACF could not sanitise the prompt", list(messages), env)
+                query = result.sanitised_text
+                messages = [
+                    *messages[:-1],
+                    {**messages[-1], "content": [text_content_block_from_string(query)]},
+                ]
+        elif self._hook == "on_context":
+            # ToolsExecutor has already appended these messages. Check only the
+            # current batch, before the model sees it.
+            start = len(messages)
+            while start and messages[start - 1]["role"] == "tool":
+                start -= 1
+            if start == len(messages):
+                return query, runtime, env, messages, args
+            checked = list(messages)
+            for index in range(start, len(messages)):
+                message = messages[index]
+                original = "\n".join(
+                    block["content"] for block in message["content"]
+                    if block["type"] == "text"
+                )
+                if message.get("error") is not None:
+                    original = "\n".join((original, str(message["error"])))
+                result = self._firewall.on_context([original])[0]
+                if result.decision == Decision.ALLOW:
+                    continue
+                if result.decision == Decision.BLOCK or result.sanitised_text is None:
+                    # The model must not get another turn after a blocked
+                    # tool result. Scrub the whole batch from the trace too.
+                    safe_messages = [
+                        *messages[:start],
+                        *(
+                            {**tool, "content": [text_content_block_from_string("[ACF blocked tool output]")], "error": None}
+                            for tool in messages[start:]
+                        ),
+                    ]
+                    raise AbortAgentError("ACF blocked the tool output", safe_messages, env)
+                checked[index] = {
+                    **message,
+                    "content": [text_content_block_from_string(result.sanitised_text)],
+                    "error": None,
+                }
+            messages = checked
+        return query, runtime, env, messages, args
+
+
+class ACFGuardedToolsExecutor(ToolsExecutor):
+    """Reject the whole tool batch before executing any denied call."""
+
+    def __init__(self, firewall: Firewall) -> None:
+        super().__init__()
+        self._firewall = firewall
+
+    def query(self, query, runtime, env=EmptyEnv(), messages=(), extra_args=None):
+        if messages and messages[-1]["role"] == "assistant":
+            for call in messages[-1].get("tool_calls") or []:
+                result = self._firewall.on_tool_call(call.function, dict(call.args))
+                if result != Decision.ALLOW:
+                    # AgentDojo derives its action trace from assistant messages.
+                    # Remove this batch since no tool has run yet.
+                    safe_messages = [*messages[:-1], {**messages[-1], "tool_calls": []}]
+                    raise AbortAgentError("ACF blocked the tool call", safe_messages, env)
+        return super().query(query, runtime, env, messages, extra_args or {})
 
 
 def build_pipeline(
     condition: Condition,
     llm: str | BasePipelineElement,
     model_id: str | None = None,
+    firewall: Firewall | None = None,
 ) -> AgentPipeline:
     """Assemble an AgentPipeline for one condition.
 
@@ -113,21 +174,10 @@ def build_pipeline(
         against a local Ollama server serving llama3.2 on port 11434 --
         see README.md.
 
-    Only C0 (no ACF element) is fully wired today. Every other condition
-    calls condition.build_defense(), which raises NotImplementedError until
-    someone wires its ACFPipelineElement(s) in -- see conditions.py.
+    Conditions with ACF hooks require a live sidecar and ACF_HMAC_KEY.
     """
-    if condition.name != "C0":
-        # Any condition beyond C0 needs at least one wired ACFPipelineElement.
-        # Check before touching the LLM/provider client at all, so an unwired
-        # condition reports "not wired" even with no API key configured,
-        # rather than failing on a missing credential first.
-        condition.build_defense()
-        raise AssertionError(
-            f"condition.build_defense() for {condition.name!r} returned "
-            "instead of raising -- build_pipeline needs updating to "
-            "actually splice the returned element(s) in once wiring lands."
-        )
+    if condition.acf_hooks and firewall is None:
+        firewall = Firewall()
 
     from agentdojo.agent_pipeline.agent_pipeline import get_llm, load_system_message
     from agentdojo.agent_pipeline.tool_execution import tool_result_to_str
@@ -144,9 +194,22 @@ def build_pipeline(
         llm_element = llm
         llm_name = llm.name
 
-    tools_loop = ToolsExecutionLoop([ToolsExecutor(tool_result_to_str), llm_element])
+    tool_executor = (
+        ACFGuardedToolsExecutor(firewall)
+        if "on_tool_call" in condition.acf_hooks
+        else ToolsExecutor(tool_result_to_str)
+    )
+    loop_elements = [tool_executor]
+    if "on_context" in condition.acf_hooks:
+        loop_elements.append(ACFPipelineElement(firewall, "on_context"))
+    loop_elements.append(llm_element)
+    tools_loop = ToolsExecutionLoop(loop_elements)
+    elements = [system_message_component, init_query_component]
+    if "on_prompt" in condition.acf_hooks:
+        elements.append(ACFPipelineElement(firewall, "on_prompt"))
+    elements.extend((llm_element, tools_loop))
     pipeline = AgentPipeline(
-        [system_message_component, init_query_component, llm_element, tools_loop]
+        elements
     )
     # Some attacks (e.g. important_instructions) call
     # get_model_name_from_pipeline(pipeline), which requires pipeline.name to

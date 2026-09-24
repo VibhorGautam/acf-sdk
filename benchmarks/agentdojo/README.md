@@ -1,22 +1,21 @@
-# AgentDojo scaffold (WIP)
+# AgentDojo ACF runner
 
-Scaffold for running [AgentDojo](https://github.com/ethz-spylab/agentdojo) as
+Runner for [AgentDojo](https://github.com/ethz-spylab/agentdojo) as
 the model-in-the-loop benchmark referenced throughout `evaluation.tex`'s
 `%% TODO before submission` markers (End-to-End Attack Success, Utility
 Preservation, Contribution of Multi-Surface Coverage, Attribution Between
 Detection and Authorisation).
 
-**Division of labor**: this scaffold defines the condition registry, the
-AgentDojo pipeline-splice point, and a runner CLI. Wiring each condition's
-actual ACF firewall calls (`Firewall.on_prompt` / `on_context` /
-`on_tool_call`) and building the paper's result tables is explicitly out of
-scope here — every extension point below raises `NotImplementedError` with a
-pointer back to this file until that lands.
+The runner wires `on_prompt` before the first model call, `on_tool_call`
+before tool execution, and `on_context` after the tool returns. C0 has no
+ACF hook. For the other conditions, the runner builds and starts a sidecar
+from this checkout on a private socket with a fresh HMAC key. No end-to-end
+result tables have been produced yet.
 
 ## Install
 
 ```sh
-pip install agentdojo          # pins to 0.1.35 as of this scaffold, see manifest.json
+pip install 'agentdojo==0.1.35'
 pip install -e sdk/python       # the ACF SDK itself
 ```
 
@@ -25,13 +24,13 @@ needed for a cloud model. A local model works with no API key at all: point
 `--model local` (or `--model vllm_parsed`) at an OpenAI-compatible server on
 `localhost` via `--model-id <model served>` and, if the server isn't on port
 8000, the `LOCAL_LLM_PORT` env var. `build_pipeline`/`get_llm` resolve
-`"local"`/`"vllm_parsed"` the same way `AgentPipeline.from_config` does —
+`"local"`/`"vllm_parsed"` the same way `AgentPipeline.from_config` does -
 verified end to end against a real local Ollama server (see "Live-tested
-against a local model" below). Every offline test and the C1/C3/C4/C5 "not
-wired yet" CLI path also works without any credentials.
+against a local model" below). Offline tests work without credentials.
+The managed sidecar uses a Unix socket, so this runner needs Linux or macOS.
 
 `manifest.json` in this folder pins the exact AgentDojo version, license, and
-the full list of task suites/attacks this scaffold was checked against —
+the full list of task suites/attacks this runner was checked against -
 verified by installing the real package into a clean venv and inspecting its
 source (`inspect.getsource`/`inspect.signature`), not from memory or docs
 alone. It's deliberately separate from `../manifest.json`, which is owned by
@@ -42,7 +41,7 @@ the InjecAgent/PINT runner's own re-pin workflow.
 - Four task suites: `banking`, `slack`, `travel`, `workspace`. Default
   benchmark version `v1.2.2`.
 - Attacks are named strings loaded via
-  `agentdojo.attacks.attack_registry.load_attack(name, suite, pipeline)` —
+  `agentdojo.attacks.attack_registry.load_attack(name, suite, pipeline)` -
   see `manifest.json` for the full list (`important_instructions`,
   `tool_knowledge`, `injecagent`, several DoS variants, etc.).
 - A custom agent/defense is any `agentdojo.agent_pipeline.BasePipelineElement`
@@ -53,10 +52,10 @@ the InjecAgent/PINT runner's own re-pin workflow.
   ```
 - `AgentPipeline(elements)` just runs `.query()` on each element in sequence,
   threading the returned tuple forward. `AgentPipeline.from_config()` builds
-  one from a `PipelineConfig`, but its `defense=` field only accepts a name
+  1 from a `PipelineConfig`, but its `defense=` field only accepts a name
   from AgentDojo's own fixed `DEFENSES` list (`tool_filter`,
   `transformers_pi_detector`, `repeat_user_prompt`,
-  `spotlighting_with_delimiting`) — a custom defense like ACF can't go through
+  `spotlighting_with_delimiting`) - a custom defense like ACF can't go through
   that field, it raises `ValueError("Invalid defense name")`.
 - So a custom defense has to be spliced into a manually-assembled element
   list instead. Reading `AgentPipeline.from_config`'s own source for its
@@ -69,7 +68,8 @@ the InjecAgent/PINT runner's own re-pin workflow.
   pipeline = AgentPipeline([system_message_component, init_query_component,
                             llm, tools_loop])
   ```
-  That's the `on_context` / `on_tool_call` enforcement point. An `on_prompt`
+  That's the `on_context` enforcement point. `on_tool_call` checks the batch
+  before execution through `ACFGuardedToolsExecutor`. An `on_prompt`
   element belongs earlier, between `init_query_component` and `llm`:
   ```python
   AgentPipeline([system_message_component, init_query_component,
@@ -77,50 +77,42 @@ the InjecAgent/PINT runner's own re-pin workflow.
   ```
 - Per-task results come back as a `SuiteResults` dict with
   `utility_results`, `security_results` (keyed by `(user_task_id,
-  injection_task_id)`), and `injection_tasks_utility_results` — structured
-  data, not just printed output. `security_results[k] is False` means the
-  attack succeeded for that pair.
+  injection_task_id)`), and `injection_tasks_utility_results` - structured
+  data, not just printed output. `security_results[k] is True` means the
+  attack succeeded for that pair. AgentDojo ignores selected injection task IDs
+  for DoS attacks and always runs the suite's first injection task. The runner
+  rejects `--injection-tasks` for these attacks and records the effective IDs.
 
 ## Conditions (C0-C5)
 
-Defined in `conditions.py`, inferred from `evaluation.tex`'s own wording —
+Defined in `conditions.py`, inferred from `evaluation.tex`'s own wording -
 not yet agreed with the team, adjust freely:
 
 | Condition | ACF hooks active | Source line in evaluation.tex |
 |---|---|---|
 | C0 | none (undefended baseline) | "run AgentDojo for C0 and C5" |
 | C1 | `on_prompt` | "compare C1 prompt-only enforcement with C5 full ACF" |
-| C3 | `on_context` | "the 2 layers" — that section is specifically "the detector replay evaluates injected content" (on_context) vs "the authorisation replay evaluates the tool names" (on_tool_call); on_prompt never comes up there, it's PINT's own separate replay, already covered by C1 |
-| C4 | `on_tool_call` | ditto — tool authorisation layer only |
-| C5 | `on_prompt`, `on_context`, `on_tool_call` | "full ACF" |
+| C3 | `on_context` | Content detection on tool output |
+| C4 | `on_tool_call` | Tool checks before execution, including parameter scans |
+| C5 | `on_prompt`, `on_context`, `on_tool_call` | All currently wired hooks |
 
-C2 is intentionally absent — `evaluation.tex` never names it, so nothing is
+C2 is intentionally absent - `evaluation.tex` never names it, so nothing is
 invented to fill the gap.
 
 ## Files
 
-- `conditions.py` — the `CONDITIONS` registry above. `CONDITIONS["C0"].build_defense()`
-  returns `None`; every other condition's `build_defense()` raises
-  `NotImplementedError` until its ACF pipeline element is wired.
-- `acf_pipeline.py` — `ACFPipelineElement(BasePipelineElement)` (one instance
-  per active hook; `.query()` is a stub) and
-  `build_pipeline(condition, llm, model_id=None)`, which fully assembles a
-  real `AgentPipeline` for C0 today and raises `NotImplementedError` for
-  C1/C3/C4/C5 before ever touching a provider client (so the "not wired"
-  path works with no API key set). `llm` takes a `ModelsEnum` string (cloud),
+- `conditions.py` - the `CONDITIONS` registry above.
+- `acf_pipeline.py` - ACF hook elements and `build_pipeline(condition, llm,
+  model_id=None)`. `llm` takes a `ModelsEnum` string (cloud),
   `"local"`/`"vllm_parsed"` (local server, pair with `model_id`), or a
   `BasePipelineElement` instance directly.
-- `run_agentdojo.py` — CLI: `--condition --suite --attack --model
-  [--model-id] [--benchmark-version] [--user-tasks ...] [--out]`. Writes a
-  JSON result record; for an unwired condition the record has
-  `"status": "not_wired"` and a `"detail"` message, exit code 1. For C0 it
-  actually calls `agentdojo.benchmark.benchmark_suite_with_injections`
-  (wrapped in `with OutputLogger(logdir=None):`, see "Live-tested against a
-  local model" below) and records `utility_rate` / `security_rate` /
-  `attack_success_rate` alongside the raw per-task results.
-- `test_scaffold.py` — offline tests (no network, no API keys): condition
-  registry shape, `ACFPipelineElement` construction/stub behaviour, and that
-  `build_pipeline` assembles a real `AgentPipeline` for C0 using a dummy
+- `run_agentdojo.py` - CLI: `--condition --suite --attack --model
+  [--model-id] [--benchmark-version] [--user-tasks ...]
+  [--injection-tasks ...] [--acf-config path] [--out]`. It runs benign
+  tasks and attacked tasks and records benign utility, utility under attack,
+  and ASR. Existing output paths are never overwritten.
+- `test_scaffold.py` - offline tests (no network, no API keys): condition
+  registry, hook decisions, and `AgentPipeline` assembly with a dummy
   in-process LLM stand-in. Run with:
   ```sh
   python3 -m pytest benchmarks/agentdojo/test_scaffold.py -v
@@ -137,15 +129,15 @@ turned up doing this, both fixed in this scaffold:
    `run_task_with(out)_injection_tasks` it calls) reads `Logger.get()` to
    build a `TraceLogger`, but never opens a logger context itself. With
    nothing entered, `Logger.get()` falls back to a bare `NullLogger()` whose
-   `.logdir` was never set (its own `__enter__` sets `.logdir` but — unlike
-   the base `Logger.__enter__` — doesn't push onto `LOGGER_STACK`, so
+   `.logdir` was never set (its own `__enter__` sets `.logdir` but, unlike
+   the base `Logger.__enter__`, doesn't push onto `LOGGER_STACK`, so
    `Logger.get()` never sees it even inside `with NullLogger():`). Fixed by
    wrapping the call in `with OutputLogger(logdir=None):` instead, which
    does push correctly via the inherited base `__enter__`/`__exit__`.
 2. Attacks that name-drop the model (`important_instructions` and its
    variants) call `get_model_name_from_pipeline(pipeline)`, which requires
-   `pipeline.name` to contain one of `agentdojo.attacks.base_attacks.
-   MODEL_NAMES`'s keys as a substring — a real model string, or literally
+   `pipeline.name` to contain 1 of `agentdojo.attacks.base_attacks.
+   MODEL_NAMES`'s keys as a substring, a real model string, or literally
    `"local"`/`"vllm_parsed"`. A custom label like `"agentdojo-C0"` fails that
    lookup with a `ValueError`. Fixed by keeping the raw model identifier in
    `pipeline.name` (`f"{llm_name}-{condition.name}"`, e.g. `"local-C0"`).
@@ -162,16 +154,39 @@ python3 benchmarks/agentdojo/run_agentdojo.py \
 
 `"status": "completed"`, all 9 `important_instructions` injection tasks run
 against `user_task_0`, JSON result written with per-pair `utility_results`/
-`security_results` plus aggregate rates. `utility_rate` and `security_rate`
-both came out `0.0` for this run — llama3.2 (2GB, no fine-tuning for this
-kind of agentic task) neither solved the banking task correctly nor resisted
-the injection, which is unsurprising for a small local model and an
-undefended C0 baseline; it's not evidence about ACF, since no ACF hook runs
-in C0. Confirms the scaffold's plumbing works end to end, not that any
-particular model/attack pair is a meaningful result.
+`security_results` plus aggregate rates. The previous C0 local run used
+llama3.2, which failed the banking task. It confirms the runner reaches a
+real model, but says nothing about ACF or a useful baseline for the paper.
 
 ## What hasn't been done
 
-No run against a paid cloud model. C1/C3/C4/C5 still need their ACF pipeline
-elements wired before they'll run against any model, local or cloud. No
-result tables exist yet.
+No run against the agreed cloud model or shared benchmark harness yet. C1/C3/C4/C5
+have offline tests and a live-sidecar smoke test, but no model-in-the-loop
+result or trace review. The default ACF allowlists include only demo tools.
+C4/C5 stop before running if the selected config or its policy file excludes
+normal tools in the AgentDojo suite. Prepare a separate benchmark config and
+policy copy with the suite's legitimate tool names in both allowlists, then
+pass its absolute path with `--acf-config`. The runner launches the sidecar
+it builds with that config and stores hashes for the config and policy files.
+Keep that config copy, its policies, and the source commit for the paper.
+
+The context hook is a proxy for tool output because ACF v1 has no
+`on_tool_result` hook. It sends the output with `rag` provenance, not
+`tool_output` provenance. Tool errors are scanned with output text. SANITISE
+replaces the output and clears the original error. The SDK decodes JSON-quoted
+sanitised strings. A context BLOCK ends the agent turn before the
+model sees the result. A blocked tool batch stops before execution. SANITISE
+on tool arguments also aborts because the runner cannot safely parse
+arbitrary sanitised text back into AgentDojo arguments. C4/C5 do not isolate
+name-based authorisation when all legitimate suite tools are allowlisted;
+record hook decisions separately before claiming which layer stopped attacks.
+The conditions do not guarantee identical model trajectories. The string-based
+`on_context` proxy cannot exercise the sidecar's structural context-size rule.
+Keep both limits visible in paper comparisons.
+
+The JSON includes the AgentDojo version, checkpoint and decoding settings,
+checkout commit and local diff hash, plus the ACF config and policy hashes
+for defended runs. AgentDojo's `local` backend picks a random seed for every
+request, so the recorded settings alone do not make local runs deterministic.
+Use repeated runs with a pinned model and config before reporting paper
+numbers. The earlier llama3.2 C0 run was only a plumbing check.
